@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { useSelector, useDispatch } from "react-redux";
 import { makeStyles } from "@mui/styles";
 
@@ -31,6 +31,7 @@ import CloseIcon from "@mui/icons-material/Close";
 import PrecisionManufacturingIcon from "@mui/icons-material/PrecisionManufacturing";
 
 import { setConfiguration, setSnackBarText } from "./ConfigureStore";
+import { resolveOptions } from "./optionProviders";
 import {
   getIn,
   setIn,
@@ -48,6 +49,7 @@ import Map from "../components/Map/Map";
 import VideoPreview from "../components/VideoPreview/VideoPreview";
 import ColorButton from "../components/ColorButton/ColorButton";
 import ThemePreview from "../components/ThemePreview/ThemePreview";
+import InteractionEditor from "../components/Tabs/Layers/Interactions/InteractionEditor";
 import MDEditor from "@uiw/react-md-editor";
 import CodeMirror from "@uiw/react-codemirror";
 import { json } from "@codemirror/lang-json";
@@ -79,6 +81,12 @@ const useStyles = makeStyles((theme) => ({
     },
     "& .MuiTabScrollButton-root": {
       color: theme.palette.swatches.grey[1000],
+    },
+    // A disabled scroll button (e.g. the left one at the start) keeps its 40px
+    // width at opacity 0 by default, leaving an empty gap before the first tab.
+    "& .MuiTabScrollButton-root.Mui-disabled": {
+      width: 0,
+      overflow: "hidden",
     },
   },
   contentTabs: {
@@ -161,6 +169,11 @@ const useStyles = makeStyles((theme) => ({
   },
   text: {
     width: "100%",
+  },
+  textareaInput: {
+    fontFamily: "monospace",
+    fontSize: "13px",
+    lineHeight: 1.4,
   },
   textArrayHexes: {
     display: "flex",
@@ -372,6 +385,44 @@ const DrawColormap = ({ src, colormapName }) => {
   );
 };
 
+/**
+ * Renders a component whose dropdown options come from a provider rather than
+ * the manifest (`"optionsFrom": "layerProperties"`). The provider is async and
+ * cached, so this shows the component's declared `options` — usually none —
+ * until it answers.
+ */
+const WithDynamicOptions = ({ com, layer, children }) => {
+  const configuration = useSelector((state) => state.core.configuration);
+  const layerTypeConfiguration = useSelector(
+    (state) => state.core.layerTypeConfiguration
+  );
+  const [options, setOptions] = useState(null);
+
+  const missionPath = configuration?.msv?.mission
+    ? `Missions/${configuration.msv.mission}/`
+    : "";
+
+  useEffect(() => {
+    let alive = true;
+    resolveOptions(com.optionsFrom, {
+      layer,
+      configuration,
+      layerTypeConfiguration,
+      missionPath,
+    }).then((o) => {
+      if (alive) setOptions(o);
+    });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [com.optionsFrom, layer?.uuid, layer?.url]);
+
+  return children(
+    options == null || options.length === 0 ? com.options || [] : options
+  );
+};
+
 const getComponent = (
   com,
   configuration,
@@ -384,7 +435,8 @@ const getComponent = (
   value,
   forceField,
   dispatch,
-  fieldDefaults
+  fieldDefaults,
+  dynamicOptions
 ) => {
   const directConf =
     layer == null ? (tool == null ? (component == null ? configuration : component) : tool) : layer;
@@ -518,6 +570,55 @@ const getComponent = (
       );
       return (
         <div>
+          {inlineHelp ? (
+            <>
+              {inner}
+              <div
+                className={c.subtitle2}
+                dangerouslySetInnerHTML={{ __html: com.description || "" }}
+              ></div>
+            </>
+          ) : (
+            <Tooltip title={com.description || ""} placement="top" arrow>
+              {inner}
+            </Tooltip>
+          )}
+        </div>
+      );
+    case "textarea":
+      inner = (
+        <TextField
+          className={c.text}
+          label={com.name}
+          variant="filled"
+          size="small"
+          multiline
+          minRows={com.rows || 4}
+          disabled={disabled || isDisabled}
+          required={isRequired}
+          error={hasError}
+          helperText={hasError ? "This field is required" : ""}
+          FormHelperTextProps={{
+            className: c.noMarginHelperText,
+          }}
+          inputProps={{
+            autoComplete: "off",
+            // A multiline value is usually something written in another
+            // language (a query, a template, a shader snippet), where
+            // alignment is part of the meaning.
+            className: c.textareaInput,
+            spellCheck: false,
+          }}
+          value={fieldValue}
+          onChange={(e) => {
+            if (!isDisabled) {
+              updateConfiguration(forceField || com.field, e.target.value, layer);
+            }
+          }}
+        />
+      );
+      return (
+        <div style={isDisabled ? { opacity: 0.5 } : {}}>
           {inlineHelp ? (
             <>
               {inner}
@@ -1080,6 +1181,31 @@ const getComponent = (
         </div>
       );
     case "dropdown": {
+      // A component may name a provider for options it can't know when it was
+      // written ("a property of this layer's data"); until the provider
+      // answers, whatever it declared literally is what shows.
+      if (com.optionsFrom != null && dynamicOptions == null)
+        return (
+          <WithDynamicOptions com={com} layer={layer}>
+            {(options) =>
+              getComponent(
+                { ...com, options },
+                configuration,
+                layer,
+                tool,
+                component,
+                updateConfiguration,
+                c,
+                inlineHelp,
+                value,
+                forceField,
+                dispatch,
+                fieldDefaults,
+                options
+              )
+            }
+          </WithDynamicOptions>
+        );
       const isOptionObject = (o) => typeof o === "object" && o !== null;
       const optionValue = (o) => (isOptionObject(o) ? o.value : o);
       const optionLabel = (o) =>
@@ -1142,6 +1268,28 @@ const getComponent = (
       );
     }
     case "searchdropdown":
+      if (com.optionsFrom != null && dynamicOptions == null)
+        return (
+          <WithDynamicOptions com={com} layer={layer}>
+            {(options) =>
+              getComponent(
+                { ...com, options },
+                configuration,
+                layer,
+                tool,
+                component,
+                updateConfiguration,
+                c,
+                inlineHelp,
+                value,
+                forceField,
+                dispatch,
+                fieldDefaults,
+                options
+              )
+            }
+          </WithDynamicOptions>
+        );
       let searchOptions = com.options;
 
       // Support for dynamic injection through mustache
@@ -1605,6 +1753,27 @@ const getComponent = (
           {section}
         </div>
       );
+    case "interactions":
+      return (
+        <InteractionEditor
+          layer={layer}
+          renderSettings={(rows) =>
+            makeConfig(
+              updateConfiguration,
+              { rows },
+              configuration,
+              layer,
+              tool,
+              component,
+              c,
+              false,
+              inlineHelp,
+              dispatch
+            )
+          }
+          updateConfiguration={updateConfiguration}
+        />
+      );
     case "map":
       return (
         <div className={c.map} style={{ height: com.height || "200px" }}>
@@ -1623,7 +1792,11 @@ const getComponent = (
       let tools = configuration?.tools || null;
       tools = tools
         .filter((tool) => {
-          return tool?.separatedTool !== true && tool?.on !== false;
+          return (
+            tool?.separatedTool !== true &&
+            tool?.separatedTool !== "custom" &&
+            tool?.on !== false
+          );
         })
         .map((tool) => tool.name);
 
@@ -1846,7 +2019,7 @@ export default function Maker(props) {
   if (toolName) tool = getToolFromConfiguration(toolName, configuration);
 
   let component = null;
-  if (componentName) component = getComponentFromConfiguration(componentName, configuration);
+  if (componentName) component = getComponentFromConfiguration(componentName, configuration) || {};
 
   const updateConfiguration = (
     keyPath,
@@ -1866,9 +2039,9 @@ export default function Maker(props) {
         keyPath.split("."),
         value
       );
-    } else if (component != null) {
+    } else if (componentName != null) {
       updateComponentInConfiguration(
-        component.name,
+        componentName,
         nextConfiguration,
         keyPath.split("."),
         value

@@ -2,6 +2,11 @@ import $ from 'jquery'
 import L_ from '../Layers_/Layers_'
 import { toolModules, toolConfigs } from '../../../pre/tools'
 import useUIStore from '../UserInterface_/store/uiStore'
+import { getSeparatedMode, resolveToolJs } from './toolControllerHelpers'
+
+// Once per name: a miss is usually in a click handler, so warning every time
+// would be a console full of the same line.
+const _warnedMissingTools = new Set()
 
 let ToolController_ = {
     tools: null,
@@ -37,8 +42,20 @@ let ToolController_ = {
             if (tm && typeof tm.initialize === 'function') tm.initialize()
         })
 
-        // Publish separated tools list to store (React renders them)
-        const separatedTools = tools.filter((t) => t.separatedTool === true)
+        // separatedTool is defined solely by the plugin manifest (toolConfigs),
+        // like `expandable`. `true` = framed panel, "custom" = chrome-less
+        // (tool owns its DOM); anything else (incl. unset) = not separated.
+        const separatedTools = tools.filter((t) => {
+            const raw = toolConfigs[t.name]?.separatedTool
+            if (raw != null && !getSeparatedMode(toolConfigs, t.name)) {
+                console.warn(
+                    `Tool "${t.name}" has an unrecognized separatedTool value ${JSON.stringify(
+                        raw
+                    )}; expected true or "custom". Treating it as not separated.`
+                )
+            }
+            return getSeparatedMode(toolConfigs, t.name) != null
+        })
         useUIStore.getState().setSeparatedToolsList(separatedTools)
 
         // Auto-open separated tools that have on === true
@@ -92,7 +109,86 @@ let ToolController_ = {
     },
     getTool: function (name) {
         var tool = this.toolModules[name]
+        if (tool == null && !_warnedMissingTools.has(name)) {
+            // The stub keeps a caller from throwing, but silence turns "the
+            // tool isn't in this mission's toolbar" into "my plugin does
+            // nothing", which is the harder thing to debug.
+            _warnedMissingTools.add(name)
+            console.warn(
+                `ToolController_.getTool('${name}'): no such tool is loaded — calls on it do nothing. Is it in the mission's toolbar and enabled?`
+            )
+        }
         return tool || { use: function () {} }
+    },
+    // openTool/closeTool — type-agnostic public API (keyed by tool name, e.g.
+    // 'Identifier') so plugins have one call regardless of tool kind. Both
+    // no-op if the tool is already in the requested state.
+    openTool: function (name) {
+        if (getSeparatedMode(toolConfigs, name)) {
+            const toolModuleName = name + 'Tool'
+            const tM = this.toolModules[toolModuleName]
+            if (!tM || tM.made === true) return
+            tM.make(`toolContentSeparated_${name}`)
+            this.activeSeparatedTools.push(toolModuleName)
+            useUIStore.getState().addActiveSeparatedTool(toolModuleName)
+            document.dispatchEvent(
+                new CustomEvent('toggleSeparatedTool', {
+                    detail: {
+                        toggledToolName: resolveToolJs(this.tools, name),
+                        visible: true,
+                    },
+                })
+            )
+        } else {
+            const idx = (this.tools || []).findIndex((t) => t.name === name)
+            if (idx < 0) return
+            const toolModuleName = this.toolModuleNames[idx]
+            if (this.activeToolName === toolModuleName) return
+            this.makeTool(toolModuleName, idx)
+            useUIStore.getState().setActiveToolName(this.activeToolName)
+            document.dispatchEvent(
+                new CustomEvent('toolChange', {
+                    detail: {
+                        activeTool: this.activeTool,
+                        activeToolName: this.activeToolName,
+                    },
+                })
+            )
+        }
+    },
+    closeTool: function (name) {
+        if (getSeparatedMode(toolConfigs, name)) {
+            const toolModuleName = name + 'Tool'
+            const tM = this.toolModules[toolModuleName]
+            if (!tM || tM.made === false) return
+            tM.destroy()
+            this.activeSeparatedTools = this.activeSeparatedTools.filter(
+                (a) => a !== toolModuleName
+            )
+            useUIStore.getState().removeActiveSeparatedTool(toolModuleName)
+            document.dispatchEvent(
+                new CustomEvent('toggleSeparatedTool', {
+                    detail: {
+                        toggledToolName: resolveToolJs(this.tools, name),
+                        visible: false,
+                    },
+                })
+            )
+        } else {
+            const idx = (this.tools || []).findIndex((t) => t.name === name)
+            if (idx < 0) return
+            if (this.activeToolName === this.toolModuleNames[idx]) {
+                this.closeActiveTool()
+                document.dispatchEvent(
+                    new CustomEvent('toolChange', {
+                        detail: {
+                            activeTool: this.activeTool,
+                            activeToolName: this.activeToolName,
+                        },
+                    })
+                )
+            }
+        }
     },
     makeTool: function (name, idx) {
         var tool = this.getTool(name)
